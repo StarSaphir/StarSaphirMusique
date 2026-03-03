@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Expose filesDir/thumbs/ — utilisé pour les artworks MediaSession/Auto/SystemUI -->
+    <files-path name="thumbs" path="thumbs/" />
+    <!-- Expose aussi les tracks (lecture depuis ContentProvider si besoin) -->
+    <files-path name="tracks" path="tracks/" />
+</paths>
