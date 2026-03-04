@@ -14,9 +14,17 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.session.CommandButton
+import androidx.media3.session.LibraryResult
 import androidx.media3.session.MediaLibraryService
 import androidx.media3.session.MediaSession
+import androidx.media3.session.SessionCommand
 import androidx.media3.session.SessionCommands
+import androidx.media3.session.SessionResult
+import com.google.common.collect.ImmutableList
+import com.google.common.util.concurrent.Futures
+import com.google.common.util.concurrent.ListenableFuture
+import com.google.common.util.concurrent.SettableFuture
 import com.ytmusic.core.domain.model.Track
 import com.ytmusic.core.domain.repository.PlaylistRepository
 import com.ytmusic.core.domain.repository.SettingsRepository
@@ -30,6 +38,9 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.launch
 import javax.inject.Inject
+
+private const val CMD_TOGGLE_SHUFFLE = "CMD_TOGGLE_SHUFFLE"
+private const val CMD_QUIT_PLAYLIST  = "CMD_QUIT_PLAYLIST"
 
 @OptIn(UnstableApi::class)
 @AndroidEntryPoint
@@ -73,13 +84,19 @@ class PlayerService : MediaLibraryService() {
         setupLoudnessEnhancer()
 
         mainScope.launch {
-            settingsRepository.getNormalizationEnabled().collect { enabled: Boolean ->
+            settingsRepository.getNormalizationEnabled().collect { enabled ->
                 loudnessEnhancer?.enabled = enabled
             }
         }
     }
 
-    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo) = mediaSession
+    // Retourne null pour Android Auto (gearhead) : il doit se connecter
+    // à AutoMediaBrowserService à la place (ancienne API MediaBrowserServiceCompat).
+    // Tous les autres clients reçoivent la session Media3 normale.
+    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibrarySession? {
+        val isAndroidAuto = controllerInfo.packageName == "com.google.android.projection.gearhead"
+        return if (isAndroidAuto) null else mediaSession
+    }
 
     override fun onTaskRemoved(rootIntent: android.content.Intent?) {
         mainScope.launch { PlaybackStateManager.saveState(this@PlayerService, player, null) }
@@ -103,25 +120,52 @@ class PlayerService : MediaLibraryService() {
             session:    MediaSession,
             controller: MediaSession.ControllerInfo
         ): MediaSession.ConnectionResult {
-            val cmds = Player.Commands.Builder().addAllCommands().build()
-            return MediaSession.ConnectionResult.accept(SessionCommands.EMPTY, cmds)
+            val sessionCmds = SessionCommands.Builder()
+                .add(SessionCommand(CMD_TOGGLE_SHUFFLE, Bundle.EMPTY))
+                .add(SessionCommand(CMD_QUIT_PLAYLIST,  Bundle.EMPTY))
+                .build()
+            val playerCmds = Player.Commands.Builder().addAllCommands().build()
+
+            return MediaSession.ConnectionResult.AcceptedResultBuilder(session)
+                .setAvailableSessionCommands(sessionCmds)
+                .setAvailablePlayerCommands(playerCmds)
+                .setCustomLayout(buildCustomLayout(player.shuffleModeEnabled))
+                .build()
+        }
+
+        override fun onCustomCommand(
+            session:       MediaSession,
+            controller:    MediaSession.ControllerInfo,
+            customCommand: SessionCommand,
+            args:          Bundle
+        ): ListenableFuture<SessionResult> = when (customCommand.customAction) {
+            CMD_TOGGLE_SHUFFLE -> {
+                val newShuffle = !player.shuffleModeEnabled
+                player.shuffleModeEnabled = newShuffle
+                mediaSession?.setCustomLayout(buildCustomLayout(newShuffle))
+                Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+            }
+            CMD_QUIT_PLAYLIST -> {
+                player.stop()
+                player.clearMediaItems()
+                Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+            }
+            else -> super.onCustomCommand(session, controller, customCommand, args)
         }
 
         override fun onAddMediaItems(
             mediaSession: MediaSession,
             controller:   MediaSession.ControllerInfo,
             mediaItems:   List<MediaItem>
-        ): com.google.common.util.concurrent.ListenableFuture<List<MediaItem>> {
-            val future = com.google.common.util.concurrent.SettableFuture.create<List<MediaItem>>()
+        ): ListenableFuture<List<MediaItem>> {
+            val future = SettableFuture.create<List<MediaItem>>()
             ioScope.launch {
                 try {
-                    val allTracks: List<Track> =
-                        trackRepository.getAllTracks().firstOrNull() ?: emptyList()
-                    val resolved = mediaItems.mapNotNull { item: MediaItem ->
-                        allTracks.firstOrNull { t -> t.id == item.mediaId }?.toMediaItem()
-                            ?: item.requestMetadata.mediaUri?.let { uri ->
-                                item.buildUpon().setUri(uri).build()
-                            }
+                    val resolved = mediaItems.mapNotNull { item ->
+                        if (item.localConfiguration != null) return@mapNotNull item
+                        trackRepository.getTrackById(item.mediaId)?.toMediaItem()
+                            ?: item.requestMetadata.mediaUri
+                                ?.let { item.buildUpon().setUri(it).build() }
                     }
                     future.set(resolved)
                 } catch (e: CancellationException) {
@@ -136,13 +180,11 @@ class PlayerService : MediaLibraryService() {
         override fun onPlaybackResumption(
             mediaSession: MediaSession,
             controller:   MediaSession.ControllerInfo
-        ): com.google.common.util.concurrent.ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
-            val future = com.google.common.util.concurrent.SettableFuture
-                .create<MediaSession.MediaItemsWithStartPosition>()
+        ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
+            val future = SettableFuture.create<MediaSession.MediaItemsWithStartPosition>()
             ioScope.launch {
                 try {
-                    val tracks: List<Track> =
-                        trackRepository.getAllTracks().firstOrNull() ?: emptyList()
+                    val tracks = trackRepository.getAllTracks().firstOrNull() ?: emptyList()
                     future.set(
                         MediaSession.MediaItemsWithStartPosition(
                             tracks.map { it.toMediaItem() }, 0, C.TIME_UNSET
@@ -184,6 +226,21 @@ class PlayerService : MediaLibraryService() {
             .build()
     }
 
+    // ── Helpers de construction des boutons custom ────────────────────────────
+
+    private fun buildCustomLayout(shuffleEnabled: Boolean): List<CommandButton> = listOf(
+        CommandButton.Builder()
+            .setSessionCommand(SessionCommand(CMD_TOGGLE_SHUFFLE, Bundle.EMPTY))
+            .setDisplayName(if (shuffleEnabled) "Shuffle ON" else "Shuffle OFF")
+            .setIconResId(R.drawable.ic_shuffle)
+            .build(),
+        CommandButton.Builder()
+            .setSessionCommand(SessionCommand(CMD_QUIT_PLAYLIST, Bundle.EMPTY))
+            .setDisplayName("Quitter")
+            .setIconResId(R.drawable.ic_close)
+            .build()
+    )
+
     // ── Player listener ───────────────────────────────────────────────────────
 
     private fun createPlayerListener() = object : Player.Listener {
@@ -217,7 +274,7 @@ class PlayerService : MediaLibraryService() {
         }
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    // ── Helpers système ───────────────────────────────────────────────────────
 
     private fun setupLoudnessEnhancer() {
         try {

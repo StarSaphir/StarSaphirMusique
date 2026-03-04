@@ -3,7 +3,7 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.MEDIA_CONTENT_CONTROL" />
+    <!-- SUPPRIMÉ : MEDIA_CONTENT_CONTROL est réservé aux apps système, provoque un warning -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
@@ -30,7 +30,15 @@
             </intent-filter>
         </activity>
 
-        <!-- PlayerService — Media3 MediaLibraryService (app mobile uniquement) -->
+        <!--
+            PlayerService — les DEUX intent-filter sont obligatoires :
+            • MediaLibraryService  → connexion Media3 (app mobile, Android Auto récent)
+            • MediaBrowserService  → connexion MediaBrowserServiceCompat (SystemUI, DHU, Auto ancien)
+
+            Sans le second, SystemUI logue "onConnectFailed" et Android Auto
+            ne détecte pas l'app comme source audio.
+        -->
+        <!-- PlayerService — lecture audio Media3 (app mobile uniquement) -->
         <service
             android:name="com.ytmusic.feature.player.PlayerService"
             android:exported="true"
@@ -40,27 +48,29 @@
             </intent-filter>
         </service>
 
-        <!-- AutoMediaBrowserService — MediaBrowserServiceCompat pour Android Auto -->
+        <!--
+            AutoMediaBrowserService — navigation Android Auto.
+            PAS de foregroundServiceType : ce service ne démarre jamais
+            en foreground lui-même, il délègue à PlayerService.
+            L'absence de foregroundServiceType évite le crash
+            InvalidForegroundServiceTypeException sur Android 14+.
+        -->
         <service
             android:name="com.ytmusic.feature.player.AutoMediaBrowserService"
-            android:exported="true"
-            android:foregroundServiceType="mediaPlayback">
+            android:exported="true">
             <intent-filter>
                 <action android:name="android.media.browse.MediaBrowserService" />
             </intent-filter>
             <meta-data
-                android:name="com.google.android.gms.car.service.media.MEDIA"
-                android:value="@xml/automotive_app_desc" />
+                android:name="com.google.android.gms.car.application"
+                android:resource="@xml/automotive_app_desc" />
         </service>
 
-        <!-- Declaration Android Auto niveau application -->
         <meta-data
             android:name="com.google.android.gms.car.application"
             android:resource="@xml/automotive_app_desc" />
 
-        <!-- Désactiver l'initialisation automatique de WorkManager
-             pour que HiltWorkerFactory soit utilisée (via YTMusicApplication) -->
-        <!-- FileProvider — expose thumbs/ aux apps systèmes (MediaSession artwork, Android Auto) -->
+        <!-- FileProvider -->
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
@@ -82,7 +92,6 @@
                 tools:node="remove" />
         </provider>
 
-        <!-- WorkManager Foreground Service — type requis sur Android 14+ (targetSdk 35) -->
         <service
             android:name="androidx.work.impl.foreground.SystemForegroundService"
             android:foregroundServiceType="dataSync"
