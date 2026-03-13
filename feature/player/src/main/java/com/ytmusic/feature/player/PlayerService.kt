@@ -90,12 +90,16 @@ class PlayerService : MediaLibraryService() {
         }
     }
 
-    // Retourne null pour Android Auto (gearhead) : il doit se connecter
-    // à AutoMediaBrowserService à la place (ancienne API MediaBrowserServiceCompat).
-    // Tous les autres clients reçoivent la session Media3 normale.
+    // FIX BUG #5 : on accepte tous les clients sauf gearhead en connexion DIRECTE.
+    // AutoMediaBrowserService se connecte avec son propre package → il reçoit la session.
+    // gearhead (Android Auto) en connexion directe est rejeté → il utilisera
+    // AutoMediaBrowserService via l'intent MediaBrowserService du Manifest.
+    // Note : on vérifie aussi com.google.android.projection.gearhead pour les Automotive OS.
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibrarySession? {
-        val isAndroidAuto = controllerInfo.packageName == "com.google.android.projection.gearhead"
-        return if (isAndroidAuto) null else mediaSession
+        val pkg = controllerInfo.packageName
+        val isDirectAutoConnection = pkg == "com.google.android.projection.gearhead"
+                || pkg == "com.google.android.carassistant"
+        return if (isDirectAutoConnection) null else mediaSession
     }
 
     override fun onTaskRemoved(rootIntent: android.content.Intent?) {
@@ -181,22 +185,15 @@ class PlayerService : MediaLibraryService() {
             mediaSession: MediaSession,
             controller:   MediaSession.ControllerInfo
         ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
-            val future = SettableFuture.create<MediaSession.MediaItemsWithStartPosition>()
-            ioScope.launch {
-                try {
-                    val tracks = trackRepository.getAllTracks().firstOrNull() ?: emptyList()
-                    future.set(
-                        MediaSession.MediaItemsWithStartPosition(
-                            tracks.map { it.toMediaItem() }, 0, C.TIME_UNSET
-                        )
-                    )
-                } catch (e: CancellationException) {
-                    future.cancel(false)
-                } catch (e: Exception) {
-                    future.setException(e)
-                }
-            }
-            return future
+            // FIX lecture automatique au démarrage Auto :
+            // On retourne une liste vide pour désactiver la reprise automatique.
+            // Media3 appelle cette méthode dès qu'un client (dont gearhead via AutoMediaBrowserService)
+            // se connecte s'il détecte une session précédente — ce qui lançait toute l'archive
+            // sans action de l'utilisateur.
+            // La lecture ne démarre que sur action explicite via onPlayFromMediaId dans AutoMediaBrowserService.
+            return Futures.immediateFuture(
+                MediaSession.MediaItemsWithStartPosition(emptyList(), 0, C.TIME_UNSET)
+            )
         }
     }
 

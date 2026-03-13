@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Icône "Quitter" pour CustomAction Android Auto.
+    RÈGLE CRITIQUE : un seul <path>, fond transparent, couleur blanche.
+    Android Auto tinte toute l'icône d'une seule couleur — deux paths superposés
+    (cercle + croix) donnent un résultat illisible car les formes se soustraient.
+    Ici : simple croix (✕) épaisse, lisible à petite taille sur fond sombre Auto.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M19.778,5.636
+            C19.217,5.075 18.307,5.075 17.747,5.636
+            L12,11.383
+            L6.253,5.636
+            C5.693,5.075 4.783,5.075 4.222,5.636
+            C3.661,6.196 3.661,7.106 4.222,7.667
+            L9.969,13.414
+            L4.222,19.161
+            C3.661,19.721 3.661,20.631 4.222,21.192
+            C4.783,21.753 5.693,21.753 6.253,21.192
+            L12,15.445
+            L17.747,21.192
+            C18.307,21.753 19.217,21.753 19.778,21.192
+            C20.339,20.631 20.339,19.721 19.778,19.161
+            L14.031,13.414
+            L19.778,7.667
+            C20.339,7.106 20.339,6.196 19.778,5.636Z" />
+</vector>

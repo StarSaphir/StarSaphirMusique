@@ -3,7 +3,6 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
-    <!-- SUPPRIMÉ : MEDIA_CONTENT_CONTROL est réservé aux apps système, provoque un warning -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
@@ -19,6 +18,15 @@
         android:theme="@style/Theme.YTMusic"
         android:supportsRtl="true">
 
+        <!--
+            FIX BUG #4 : meta-data gms.car.application déclaré UNE SEULE FOIS
+            sur <application>. La duplication sur AutoMediaBrowserService
+            provoquait des comportements imprévisibles sur certaines versions DHU.
+        -->
+        <meta-data
+            android:name="com.google.android.gms.car.application"
+            android:resource="@xml/automotive_app_desc" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -31,14 +39,10 @@
         </activity>
 
         <!--
-            PlayerService — les DEUX intent-filter sont obligatoires :
-            • MediaLibraryService  → connexion Media3 (app mobile, Android Auto récent)
-            • MediaBrowserService  → connexion MediaBrowserServiceCompat (SystemUI, DHU, Auto ancien)
-
-            Sans le second, SystemUI logue "onConnectFailed" et Android Auto
-            ne détecte pas l'app comme source audio.
+            PlayerService — lecture audio Media3 (app mobile uniquement).
+            Répond uniquement aux clients Media3 (MediaController via SessionToken).
+            Android Auto est redirigé vers AutoMediaBrowserService via onGetSession().
         -->
-        <!-- PlayerService — lecture audio Media3 (app mobile uniquement) -->
         <service
             android:name="com.ytmusic.feature.player.PlayerService"
             android:exported="true"
@@ -49,11 +53,18 @@
         </service>
 
         <!--
-            AutoMediaBrowserService — navigation Android Auto.
+            AutoMediaBrowserService — point d'entrée Android Auto.
+
+            OBLIGATOIRE : android.media.browse.MediaBrowserService
+            C'est l'action que cherche Android Auto pour détecter les apps audio.
+            Sans cet intent-filter, l'app n'apparaît pas dans Auto.
+
             PAS de foregroundServiceType : ce service ne démarre jamais
-            en foreground lui-même, il délègue à PlayerService.
-            L'absence de foregroundServiceType évite le crash
-            InvalidForegroundServiceTypeException sur Android 14+.
+            en foreground lui-même. Il délègue la lecture à PlayerService
+            via MediaController. Évite InvalidForegroundServiceTypeException
+            sur Android 14+.
+
+            PAS de meta-data gms.car.application ici : il est sur <application>.
         -->
         <service
             android:name="com.ytmusic.feature.player.AutoMediaBrowserService"
@@ -61,16 +72,9 @@
             <intent-filter>
                 <action android:name="android.media.browse.MediaBrowserService" />
             </intent-filter>
-            <meta-data
-                android:name="com.google.android.gms.car.application"
-                android:resource="@xml/automotive_app_desc" />
         </service>
 
-        <meta-data
-            android:name="com.google.android.gms.car.application"
-            android:resource="@xml/automotive_app_desc" />
-
-        <!-- FileProvider -->
+        <!-- FileProvider pour les thumbnails -->
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"

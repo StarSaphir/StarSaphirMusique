@@ -1,8 +1,10 @@
 package com.ytmusic.feature.player
 
 import android.os.Bundle
+import androidx.media.app.NotificationCompat
 import android.support.v4.media.MediaBrowserCompat
 import android.support.v4.media.MediaDescriptionCompat
+import android.support.v4.media.MediaMetadataCompat
 import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
 import androidx.media.MediaBrowserServiceCompat
@@ -44,6 +46,9 @@ class AutoMediaBrowserService : MediaBrowserServiceCompat() {
         const val MEGA_PREFIX     = "AUTO_MEGA_"
         const val SUFFIX_NORMAL   = "__NORMAL"
         const val SUFFIX_SHUFFLE  = "__SHUFFLE"
+
+        // Action personnalisée "Quitter la lecture" affichée dans le lecteur Auto
+        const val ACTION_QUIT = "ACTION_QUIT_PLAYLIST"
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -52,8 +57,6 @@ class AutoMediaBrowserService : MediaBrowserServiceCompat() {
         super.onCreate()
 
         mediaSession = MediaSessionCompat(this, "AutoMediaBrowserService").apply {
-            // ⚠️ CRITIQUE : le callback doit être défini AVANT setActive(true)
-            // C'est ici qu'Android Auto envoie les commandes de lecture
             setCallback(MediaSessionCallback())
             setPlaybackState(buildStoppedState())
             isActive = true
@@ -82,9 +85,7 @@ class AutoMediaBrowserService : MediaBrowserServiceCompat() {
             try {
                 controller = controllerFuture?.get()
                 controller?.addListener(PlayerStateListener())
-            } catch (_: Exception) {
-                // PlayerService pas encore démarré — sera reconnecté à la prochaine lecture
-            }
+            } catch (_: Exception) {}
         }, MoreExecutors.directExecutor())
     }
 
@@ -94,7 +95,6 @@ class AutoMediaBrowserService : MediaBrowserServiceCompat() {
             onReady(ctrl)
             return
         }
-        // Reconnexion si nécessaire
         val token = SessionToken(
             this,
             android.content.ComponentName(this, PlayerService::class.java)
@@ -121,6 +121,10 @@ class AutoMediaBrowserService : MediaBrowserServiceCompat() {
         val extras = Bundle().apply {
             putInt("android.media.browse.CONTENT_STYLE_BROWSABLE_HINT", 1)
             putInt("android.media.browse.CONTENT_STYLE_PLAYABLE_HINT",  1)
+            // Indique à Android Auto de toujours afficher le panneau queue sur la droite
+            // quand l'écran est suffisamment large. Pas garanti sur tous les profils
+            // (c'est le système qui décide en dernier ressort), mais c'est le signal correct.
+            putBoolean("android.media.browse.SHOW_QUEUE_HINT", true)
         }
         return BrowserRoot(ROOT_ID, extras)
     }
@@ -146,12 +150,10 @@ class AutoMediaBrowserService : MediaBrowserServiceCompat() {
         }
     }
 
-    // ── MediaSession Callback — reçoit les commandes d'Android Auto ───────────
+    // ── MediaSession Callback ─────────────────────────────────────────────────
 
     inner class MediaSessionCallback : MediaSessionCompat.Callback() {
 
-        // ⚠️ CRITIQUE : c'est cette méthode qu'Android Auto appelle quand
-        // l'utilisateur tape sur un item playable. Sans elle → chargement infini.
         override fun onPlayFromMediaId(mediaId: String?, extras: Bundle?) {
             mediaId ?: return
             scope.launch {
@@ -183,10 +185,27 @@ class AutoMediaBrowserService : MediaBrowserServiceCompat() {
                 it.stop()
                 it.clearMediaItems()
             }
+            // Revenir à l'état stopped pour qu'Auto repasse en vue navigation
+            mediaSession.setMetadata(null)
+            mediaSession.setPlaybackState(buildStoppedState())
         }
 
         override fun onSeekTo(pos: Long) {
             ensureController { it.seekTo(pos) }
+        }
+
+        // Bouton "Quitter" déclaré comme CustomAction dans le PlaybackState.
+        // Android Auto l'affiche dans le lecteur à côté des contrôles standard.
+        // onCustomAction est appelé quand l'utilisateur appuie dessus.
+        override fun onCustomAction(action: String, extras: Bundle?) {
+            if (action == ACTION_QUIT) {
+                ensureController {
+                    it.stop()
+                    it.clearMediaItems()
+                }
+                mediaSession.setMetadata(null)
+                mediaSession.setPlaybackState(buildStoppedState())
+            }
         }
     }
 
@@ -226,15 +245,58 @@ class AutoMediaBrowserService : MediaBrowserServiceCompat() {
         sendToPlayer(tracks, startIndex = 0, shuffle = shuffle)
     }
 
+    /**
+     * Charge la queue dans ExoPlayer via le MediaController, puis :
+     * 1. Envoie les métadonnées du premier morceau à la MediaSessionCompat
+     *    → Android Auto peut afficher le lecteur immédiatement
+     * 2. Envoie un état STATE_PLAYING
+     *    → Android Auto bascule automatiquement vers la vue lecteur
+     *    et ne revient à la navigation que si l'utilisateur appuie sur Stop
+     */
+    /**
+     * FIX SHUFFLE : on mélange la liste EN AMONT en Kotlin avant de l'envoyer à ExoPlayer.
+     * Appeler ctrl.shuffleModeEnabled APRÈS setMediaItems ne change pas l'ordre immédiat —
+     * ExoPlayer commence toujours par startIndex. En mélangeant d'abord, le vrai premier
+     * morceau joué est aléatoire.
+     * On laisse shuffleModeEnabled = false car on a déjà mélangé manuellement — évite
+     * un double-mélange au prochain skip.
+     */
     private fun sendToPlayer(tracks: List<Track>, startIndex: Int, shuffle: Boolean) {
+        val orderedTracks = if (shuffle) tracks.shuffled() else tracks
+        val effectiveStart = if (shuffle) 0 else startIndex
+
         ensureController { ctrl ->
             scope.launch(Dispatchers.Main) {
                 ctrl.stop()
                 ctrl.clearMediaItems()
-                ctrl.setMediaItems(tracks.map { it.toMedia3Item() }, startIndex, 0L)
-                ctrl.shuffleModeEnabled = shuffle
+                ctrl.setMediaItems(orderedTracks.map { it.toMedia3Item() }, effectiveStart, 0L)
+                ctrl.shuffleModeEnabled = false // déjà mélangé manuellement
                 ctrl.prepare()
                 ctrl.play()
+
+                orderedTracks.getOrNull(effectiveStart)?.let { pushMetadata(it) }
+
+                // Alimente le panneau "Prochaines lectures" à droite
+                val queue = orderedTracks.mapIndexed { idx, track ->
+                    MediaSessionCompat.QueueItem(
+                        MediaDescriptionCompat.Builder()
+                            .setMediaId(track.id)
+                            .setTitle(track.title)
+                            .setSubtitle(track.artist)
+                            .apply {
+                                ThumbnailProvider.toContentUri(
+                                    this@AutoMediaBrowserService, track.thumbnailPath
+                                )?.let { setIconUri(it) }
+                            }
+                            .build(),
+                        idx.toLong()
+                    )
+                }
+                mediaSession.setQueue(queue)
+                mediaSession.setQueueTitle(if (shuffle) "Lecture aléatoire" else "Liste de lecture")
+                mediaSession.setPlaybackState(
+                    buildActiveState(PlaybackStateCompat.STATE_PLAYING, 0L, effectiveStart.toLong())
+                )
             }
         }
     }
@@ -243,8 +305,53 @@ class AutoMediaBrowserService : MediaBrowserServiceCompat() {
 
     inner class PlayerStateListener : Player.Listener {
         override fun onIsPlayingChanged(isPlaying: Boolean) = syncState()
-        override fun onMediaItemTransition(item: MediaItem?, reason: Int) = syncState()
+        override fun onMediaItemTransition(item: MediaItem?, reason: Int) {
+            // Sync les métadonnées à chaque changement de piste
+            item?.let { syncMetadata(it) }
+            syncState()
+        }
         override fun onPlaybackStateChanged(playbackState: Int) = syncState()
+    }
+
+    /**
+     * FIX BUG #1 : synchronise titre + artiste + artwork vers MediaSessionCompat.
+     * Android Auto lit ces métadonnées pour afficher le lecteur.
+     * Sans setMetadata(), le lecteur reste vide même si la musique joue.
+     */
+    private fun syncMetadata(item: MediaItem) {
+        val meta = item.mediaMetadata
+        val builder = MediaMetadataCompat.Builder()
+            .putString(MediaMetadataCompat.METADATA_KEY_MEDIA_ID, item.mediaId)
+            .putString(MediaMetadataCompat.METADATA_KEY_TITLE,
+                meta.title?.toString() ?: "")
+            .putString(MediaMetadataCompat.METADATA_KEY_ARTIST,
+                meta.artist?.toString() ?: "")
+            .putString(MediaMetadataCompat.METADATA_KEY_ALBUM_ART_URI,
+                meta.artworkUri?.toString() ?: "")
+
+        // Durée : disponible uniquement si ExoPlayer l'a chargée
+        val ctrl = controller
+        if (ctrl != null && ctrl.duration > 0) {
+            builder.putLong(MediaMetadataCompat.METADATA_KEY_DURATION, ctrl.duration)
+        }
+
+        mediaSession.setMetadata(builder.build())
+    }
+
+    /**
+     * Pousse les métadonnées d'un Track directement (avant que le Player
+     * ne déclenche onMediaItemTransition), pour un affichage immédiat.
+     */
+    private fun pushMetadata(track: Track) {
+        val artUri = ThumbnailProvider.toContentUri(this, track.thumbnailPath)
+        val builder = MediaMetadataCompat.Builder()
+            .putString(MediaMetadataCompat.METADATA_KEY_MEDIA_ID, track.id)
+            .putString(MediaMetadataCompat.METADATA_KEY_TITLE, track.title)
+            .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, track.artist)
+        artUri?.let {
+            builder.putString(MediaMetadataCompat.METADATA_KEY_ALBUM_ART_URI, it.toString())
+        }
+        mediaSession.setMetadata(builder.build())
     }
 
     private fun syncState() {
@@ -252,21 +359,47 @@ class AutoMediaBrowserService : MediaBrowserServiceCompat() {
         val pbState = when {
             ctrl.isPlaying -> PlaybackStateCompat.STATE_PLAYING
             ctrl.playbackState == Player.STATE_BUFFERING -> PlaybackStateCompat.STATE_BUFFERING
+            ctrl.playbackState == Player.STATE_IDLE -> PlaybackStateCompat.STATE_NONE
             else -> PlaybackStateCompat.STATE_PAUSED
         }
-        mediaSession.setPlaybackState(
-            PlaybackStateCompat.Builder()
-                .setActions(
-                    PlaybackStateCompat.ACTION_PLAY or
-                            PlaybackStateCompat.ACTION_PAUSE or
-                            PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
-                            PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or
-                            PlaybackStateCompat.ACTION_SEEK_TO or
-                            PlaybackStateCompat.ACTION_STOP
-                )
-                .setState(pbState, ctrl.currentPosition, 1f)
-                .build()
-        )
+        val activeId = if (ctrl.currentMediaItemIndex >= 0)
+            ctrl.currentMediaItemIndex.toLong() else -1L
+        mediaSession.setPlaybackState(buildActiveState(pbState, ctrl.currentPosition, activeId))
+        ctrl.currentMediaItem?.let { syncMetadata(it) }
+    }
+
+    /**
+     * Construit un PlaybackState avec :
+     * - contrôles standard play/pause/prev/next/seek/stop
+     * - ACTION_SKIP_TO_QUEUE_ITEM : tap sur un morceau dans la queue pour y sauter
+     * - CustomAction "Quitter" avec icône monochrome path unique (ic_auto_quit)
+     * - activeQueueItemId : met en surbrillance le morceau actif dans le panneau queue
+     */
+    private fun buildActiveState(
+        state: Int,
+        position: Long,
+        activeQueueId: Long = -1L
+    ): PlaybackStateCompat {
+        val quitAction = PlaybackStateCompat.CustomAction.Builder(
+            ACTION_QUIT,
+            "Quitter",
+            R.drawable.ic_auto_quit
+        ).build()
+
+        return PlaybackStateCompat.Builder()
+            .setActions(
+                PlaybackStateCompat.ACTION_PLAY or
+                        PlaybackStateCompat.ACTION_PAUSE or
+                        PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
+                        PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or
+                        PlaybackStateCompat.ACTION_SEEK_TO or
+                        PlaybackStateCompat.ACTION_STOP or
+                        PlaybackStateCompat.ACTION_SKIP_TO_QUEUE_ITEM
+            )
+            .addCustomAction(quitAction)
+            .setActiveQueueItemId(activeQueueId)
+            .setState(state, position, 1f)
+            .build()
     }
 
     private fun buildStoppedState() = PlaybackStateCompat.Builder()
@@ -295,20 +428,8 @@ class AutoMediaBrowserService : MediaBrowserServiceCompat() {
         }
     }
 
-    /**
-     * Mega Playlists : chaque playlist est affichée avec un bouton shuffle direct.
-     * Android Auto ne supporte pas la sélection multiple native, donc chaque
-     * playlist Mega a son propre bouton "Lancer en shuffle" qui combine
-     * toutes les playlists sélectionnées via l'ID concaténé.
-     *
-     * Pour combiner plusieurs playlists : l'ID du dossier Mega contient
-     * les IDs séparés par virgule (ex: "AUTO_MEGA_id1,id2").
-     * L'utilisateur navigue dans une playlist → voit le bouton shuffle
-     * qui lancera cette playlist + toutes les autres en shuffle combiné.
-     */
     private suspend fun buildMegaList(): List<MediaBrowserCompat.MediaItem> {
         val playlists = playlistRepository.getAllPlaylistsWithTracks().firstOrNull() ?: emptyList()
-        // Ajouter un item "Tout shuffler" qui combine toutes les playlists
         val allIds = playlists.map { it.id }.joinToString(",")
         val shuffleAll = if (playlists.size > 1) listOf(
             playableAction(
@@ -374,16 +495,25 @@ class AutoMediaBrowserService : MediaBrowserServiceCompat() {
         )
     }
 
-    private fun Track.toMedia3Item() = MediaItem.Builder()
-        .setMediaId(id)
-        .setUri(filePath)
-        .setMediaMetadata(
-            androidx.media3.common.MediaMetadata.Builder()
-                .setTitle(title)
-                .setArtist(artist)
-                .setIsPlayable(true)
-                .setIsBrowsable(false)
-                .build()
-        )
-        .build()
+    /**
+     * FIX BUG #3 : inclure l'artworkUri dans le MediaItem envoyé à ExoPlayer.
+     * Sans ça, PlayerStateListener.syncMetadata() ne peut pas récupérer
+     * l'artwork depuis item.mediaMetadata.artworkUri → miniature absente dans Auto.
+     */
+    private fun Track.toMedia3Item(): MediaItem {
+        val artUri = ThumbnailProvider.toContentUri(this@AutoMediaBrowserService, thumbnailPath)
+        return MediaItem.Builder()
+            .setMediaId(id)
+            .setUri(filePath)
+            .setMediaMetadata(
+                androidx.media3.common.MediaMetadata.Builder()
+                    .setTitle(title)
+                    .setArtist(artist)
+                    .setIsPlayable(true)
+                    .setIsBrowsable(false)
+                    .apply { artUri?.let { setArtworkUri(it) } }
+                    .build()
+            )
+            .build()
+    }
 }
