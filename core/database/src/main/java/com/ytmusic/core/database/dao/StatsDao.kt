@@ -78,4 +78,26 @@ interface StatsDao {
 
     @Query("SELECT AVG(dailyMs) FROM (SELECT SUM(listenedMs) as dailyMs FROM playback_sessions GROUP BY DATE(startedAt / 1000, 'unixepoch'))")
     fun getDailyAverageMs(): Flow<Double?>
+
+    /** Efface uniquement les sessions d'écoute — ne touche pas aux tracks ni playlists */
+    @Query("DELETE FROM playback_sessions")
+    suspend fun deleteAllSessions()
+
+    // Nombre total de sessions (= nombre d'écoutes)
+    @Query("SELECT COUNT(*) FROM playback_sessions")
+    fun getTotalSessionCount(): Flow<Int>
+
+    // Stats par langue — jointure sur la table tracks
+    @Query("""
+        SELECT t.language as language, SUM(s.listenedMs) as totalMs, COUNT(*) as sessionCount
+        FROM playback_sessions s
+        JOIN tracks t ON t.id = s.trackId
+        WHERE t.language IS NOT NULL AND t.language != ''
+        GROUP BY t.language
+        ORDER BY totalMs DESC
+        LIMIT :limit
+    """)
+    fun getTopLanguages(limit: Int = 20): Flow<List<LanguageListenStat>>
 }
+
+data class LanguageListenStat(val language: String, val totalMs: Long, val sessionCount: Int)

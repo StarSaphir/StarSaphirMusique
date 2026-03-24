@@ -23,8 +23,8 @@ abstract class RepositoryModule {
     abstract fun bindDownloadRepository(impl: DownloadRepositoryImpl): DownloadRepository
 
     @Binds @Singleton
-    abstract fun bindStatsRepository(impl: StatsRepositoryImpl): StatsRepository
+    abstract fun bindStatsRepository(impl: StatsAndSettingsRepositoryImpl): StatsRepository
 
     @Binds @Singleton
-    abstract fun bindSettingsRepository(impl: SettingsRepositoryImpl): SettingsRepository
+    abstract fun bindSettingsRepository(impl: StatsAndSettingsRepositoryImpl): SettingsRepository
 }

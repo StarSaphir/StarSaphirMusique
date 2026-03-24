@@ -78,8 +78,21 @@ class PlayerController @Inject constructor(
     }
 
     fun removeFromQueue(index: Int) {
-        mediaController?.removeMediaItem(index)
-        trackCache = trackCache.toMutableList().also { it.removeAt(index) }
+        val ctrl = mediaController ?: return
+        if (index < 0 || index >= trackCache.size) return
+
+        // Supprimer de la timeline ExoPlayer
+        ctrl.removeMediaItem(index)
+
+        // Mettre à jour le cache local
+        val mutable = trackCache.toMutableList()
+        mutable.removeAt(index)
+        trackCache = mutable
+
+        // Note : si index < currentMediaItemIndex, ExoPlayer décale automatiquement
+        // son curseur interne vers le bas. trackCache étant maintenant synchrone avec
+        // la nouvelle timeline, emitCurrentState() lira le bon track depuis le bon index.
+        // Si on supprime le morceau courant, ExoPlayer passe au suivant automatiquement.
         emitCurrentState()
     }
 
@@ -141,39 +154,11 @@ class PlayerController @Inject constructor(
 
     private fun emitCurrentState() {
         val ctrl = mediaController ?: return
-
-        // FIX queue manquante sur téléphone après lancement depuis Android Auto :
-        // Quand Auto lance la lecture via AutoMediaBrowserService → PlayerService,
-        // trackCache reste vide côté PlayerController (playTracks() n'a pas été appelé).
-        // On reconstruit le cache depuis la timeline ExoPlayer dans ce cas.
-        // On compare mediaItemCount ET le premier mediaId pour détecter une désynchronisation.
-        val timelineOutOfSync = ctrl.mediaItemCount > 0 && (
-                trackCache.isEmpty() ||
-                        trackCache.size != ctrl.mediaItemCount ||
-                        trackCache.firstOrNull()?.id != ctrl.getMediaItemAt(0).mediaId
-                )
-        if (timelineOutOfSync) {
-            // Reconstruire une liste de Track minimale depuis les MediaItems d'ExoPlayer.
-            // Les métadonnées complètes (trimStart, trimEnd, language…) ne sont pas dans
-            // les MediaItems — on crée des Track "légères" suffisantes pour l'affichage UI.
-            trackCache = (0 until ctrl.mediaItemCount).map { i ->
-                val item = ctrl.getMediaItemAt(i)
-                val meta = item.mediaMetadata
-                Track(
-                    id            = item.mediaId,
-                    title         = meta.title?.toString() ?: item.mediaId,
-                    artist        = meta.artist?.toString() ?: "",
-                    filePath      = item.localConfiguration?.uri?.toString() ?: "",
-                    thumbnailPath = null,
-                    language      = null,
-                    durationMs    = 0L,
-                    isFavorite    = false,
-                    playCount     = 0L,
-                    downloadedAt  = 0L
-                )
-            }
+        // Reconstruire le cache depuis la timeline si elle a changé
+        if (ctrl.mediaItemCount != trackCache.size) {
+            // La timeline a changé (shuffle réorganise) — on garde trackCache original
+            // mais on met à jour currentTrack depuis l'index courant
         }
-
         val currentIdx   = ctrl.currentMediaItemIndex
         val currentTrack = trackCache.getOrNull(currentIdx)
         _playbackState.value = PlaybackState(

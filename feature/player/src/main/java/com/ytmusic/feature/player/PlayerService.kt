@@ -3,6 +3,7 @@ package com.ytmusic.feature.player
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.media.audiofx.LoudnessEnhancer
+import android.os.PowerManager
 import android.net.Uri
 import android.os.Bundle
 import androidx.annotation.OptIn
@@ -54,6 +55,8 @@ class PlayerService : MediaLibraryService() {
     private lateinit var player: ExoPlayer
     private var mediaSession: MediaLibrarySession? = null
     private var loudnessEnhancer: LoudnessEnhancer? = null
+    private var normalizationEnabled: Boolean = false
+    private var wakeLock: PowerManager.WakeLock? = null
 
     private val ioScope   = CoroutineScope(Dispatchers.IO   + SupervisorJob())
     private val mainScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
@@ -82,10 +85,28 @@ class PlayerService : MediaLibraryService() {
 
         player.addListener(createPlayerListener())
         setupLoudnessEnhancer()
-
+        // Observer le setting normalisation pour activer/désactiver en temps réel
         mainScope.launch {
             settingsRepository.getNormalizationEnabled().collect { enabled ->
-                loudnessEnhancer?.enabled = enabled
+                normalizationEnabled = enabled
+                if (!enabled) loudnessEnhancer?.enabled = false
+            }
+        }
+
+        // Observer keepScreenOn — WakeLock géré ici pour fonctionner
+        // même quand le lecteur tourne en arrière-plan
+        val pm = getSystemService(PowerManager::class.java)
+        wakeLock = pm.newWakeLock(
+            PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ON_AFTER_RELEASE,
+            "YTMusicApp:PlayerWakeLock"
+        )
+        mainScope.launch {
+            settingsRepository.getKeepScreenOn().collect { enabled ->
+                if (enabled) {
+                    if (wakeLock?.isHeld == false) wakeLock?.acquire(4 * 60 * 60 * 1000L) // max 4h
+                } else {
+                    if (wakeLock?.isHeld == true) wakeLock?.release()
+                }
             }
         }
     }
@@ -112,6 +133,7 @@ class PlayerService : MediaLibraryService() {
         mainScope.cancel()
         mediaSession?.release()
         loudnessEnhancer?.release()
+        if (wakeLock?.isHeld == true) wakeLock?.release()
         player.release()
         super.onDestroy()
     }
@@ -185,15 +207,22 @@ class PlayerService : MediaLibraryService() {
             mediaSession: MediaSession,
             controller:   MediaSession.ControllerInfo
         ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
-            // FIX lecture automatique au démarrage Auto :
-            // On retourne une liste vide pour désactiver la reprise automatique.
-            // Media3 appelle cette méthode dès qu'un client (dont gearhead via AutoMediaBrowserService)
-            // se connecte s'il détecte une session précédente — ce qui lançait toute l'archive
-            // sans action de l'utilisateur.
-            // La lecture ne démarre que sur action explicite via onPlayFromMediaId dans AutoMediaBrowserService.
-            return Futures.immediateFuture(
-                MediaSession.MediaItemsWithStartPosition(emptyList(), 0, C.TIME_UNSET)
-            )
+            val future = SettableFuture.create<MediaSession.MediaItemsWithStartPosition>()
+            ioScope.launch {
+                try {
+                    val tracks = trackRepository.getAllTracks().firstOrNull() ?: emptyList()
+                    future.set(
+                        MediaSession.MediaItemsWithStartPosition(
+                            tracks.map { it.toMediaItem() }, 0, C.TIME_UNSET
+                        )
+                    )
+                } catch (e: CancellationException) {
+                    future.cancel(false)
+                } catch (e: Exception) {
+                    future.setException(e)
+                }
+            }
+            return future
         }
     }
 
@@ -241,29 +270,90 @@ class PlayerService : MediaLibraryService() {
     // ── Player listener ───────────────────────────────────────────────────────
 
     private fun createPlayerListener() = object : Player.Listener {
-        private var sessionStartMs = 0L
-        private var lastTrackId: String? = null
+        /**
+         * Stratégie : on accumule le temps écouté en segments.
+         * Un segment = période entre un "start" et un "stop" sur le MÊME morceau.
+         *
+         * lastTrackId     = ID du morceau actuellement suivi
+         * segmentStartMs  = timestamp du début du segment actif (0 si pas de segment)
+         * accumulatedMs   = temps déjà accumulé pour ce morceau (segments précédents)
+         *
+         * onIsPlayingChanged(true)  → ouvre un segment
+         * onIsPlayingChanged(false) → ferme le segment, accumule
+         * onMediaItemTransition     → flush + reset pour le nouveau morceau
+         */
+        private var lastTrackId:    String? = null
+        private var segmentStartMs: Long    = 0L
+        private var accumulatedMs:  Long    = 0L
+        private var segmentActive:  Boolean = false
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
-            if (isPlaying) sessionStartMs = System.currentTimeMillis() else flushSession()
+            if (isPlaying) {
+                // Ouvrir un segment si on a un morceau en cours
+                if (lastTrackId != null) {
+                    segmentStartMs = System.currentTimeMillis()
+                    segmentActive  = true
+                }
+            } else {
+                // Fermer le segment et accumuler
+                closeSegment()
+            }
         }
 
         override fun onMediaItemTransition(item: MediaItem?, reason: Int) {
-            flushSession()
+            // Fermer le segment du morceau précédent
+            closeSegment()
+            // Flush le temps accumulé sur l'ancien morceau
+            flushAccumulated()
+
+            // Initialiser pour le nouveau morceau
+            lastTrackId   = item?.mediaId
+            accumulatedMs = 0L
+            segmentActive = false
+
             item?.let {
-                lastTrackId    = it.mediaId
-                sessionStartMs = System.currentTimeMillis()
                 statsTracker.onTrackStarted(
                     it.mediaId,
                     it.mediaMetadata.extras?.getString("playlistId")
                 )
+                // Ouvrir un segment immédiatement si la lecture est active
+                if (player.isPlaying) {
+                    segmentStartMs = System.currentTimeMillis()
+                    segmentActive  = true
+                }
+                // Normalisation par morceau
+                if (normalizationEnabled) {
+                    mainScope.launch {
+                        val track  = trackRepository.getTrackById(it.mediaId)
+                        val gainDb = track?.replayGainDb ?: 0f
+                        val gainMb = (gainDb * 100).toInt()
+                        if (gainMb > 0) {
+                            loudnessEnhancer?.setTargetGain(gainMb)
+                            loudnessEnhancer?.enabled = true
+                        } else {
+                            loudnessEnhancer?.enabled = false
+                        }
+                    }
+                }
             }
         }
 
-        private fun flushSession() {
-            val elapsed = System.currentTimeMillis() - sessionStartMs
-            if (elapsed > 2000 && lastTrackId != null)
-                mainScope.launch { statsTracker.recordListenTime(lastTrackId!!, elapsed) }
+        /** Ferme le segment actif et ajoute la durée à accumulatedMs */
+        private fun closeSegment() {
+            if (!segmentActive || segmentStartMs == 0L) return
+            accumulatedMs += System.currentTimeMillis() - segmentStartMs
+            segmentStartMs = 0L
+            segmentActive  = false
+        }
+
+        /** Enregistre le temps accumulé en base si suffisant */
+        private fun flushAccumulated() {
+            val id = lastTrackId ?: return
+            if (accumulatedMs < 3_000L) return        // skip trop court
+            if (accumulatedMs > 2 * 60 * 60 * 1000L) return  // valeur aberrante
+            val ms = accumulatedMs
+            accumulatedMs = 0L
+            mainScope.launch { statsTracker.recordListenTime(id, ms) }
         }
 
         override fun onPlayerError(error: PlaybackException) {
@@ -276,7 +366,7 @@ class PlayerService : MediaLibraryService() {
     private fun setupLoudnessEnhancer() {
         try {
             loudnessEnhancer = LoudnessEnhancer(player.audioSessionId).apply {
-                setTargetGain(500); enabled = false
+                setTargetGain(0); enabled = false   // le gain est défini par morceau
             }
         } catch (_: Exception) {}
     }

@@ -13,6 +13,8 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.ytmusic.core.domain.repository.SettingsRepository
+import com.ytmusic.core.domain.repository.StatsRepository
+import com.ytmusic.feature.library.LibraryScanner
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
@@ -20,7 +22,9 @@ import javax.inject.Inject
 
 @HiltViewModel
 class SettingsViewModel @Inject constructor(
-    private val settingsRepository: SettingsRepository
+    private val settingsRepository: SettingsRepository,
+    private val statsRepository:    StatsRepository,
+    private val libraryScanner:     LibraryScanner
 ) : ViewModel() {
 
     val normalizationEnabled: StateFlow<Boolean> = settingsRepository.getNormalizationEnabled()
@@ -31,6 +35,12 @@ class SettingsViewModel @Inject constructor(
 
     val defaultQuality: StateFlow<String> = settingsRepository.getDefaultQuality()
         .stateIn(viewModelScope, SharingStarted.Lazily, "192k")
+
+    val keepScreenOn: StateFlow<Boolean> = settingsRepository.getKeepScreenOn()
+        .stateIn(viewModelScope, SharingStarted.Lazily, false)
+
+    val coverBackground: StateFlow<Boolean> = settingsRepository.getCoverBackground()
+        .stateIn(viewModelScope, SharingStarted.Lazily, false)
 
     fun setNormalization(enabled: Boolean) = viewModelScope.launch {
         settingsRepository.setNormalizationEnabled(enabled)
@@ -43,6 +53,54 @@ class SettingsViewModel @Inject constructor(
     fun setQuality(quality: String) = viewModelScope.launch {
         settingsRepository.setDefaultQuality(quality)
     }
+
+    fun setKeepScreenOn(enabled: Boolean) = viewModelScope.launch {
+        settingsRepository.setKeepScreenOn(enabled)
+    }
+
+    fun setCoverBackground(enabled: Boolean) = viewModelScope.launch {
+        settingsRepository.setCoverBackground(enabled)
+    }
+
+    // ── Reset statistiques ───────────────────────────────────────────────────
+
+    private val _resetState = MutableStateFlow<ResetState>(ResetState.Idle)
+    val resetState: StateFlow<ResetState> = _resetState
+
+    sealed class ResetState {
+        object Idle    : ResetState()
+        object Running : ResetState()
+        object Done    : ResetState()
+    }
+
+    fun resetListenStats() {
+        if (_resetState.value is ResetState.Running) return
+        viewModelScope.launch {
+            _resetState.value = ResetState.Running
+            statsRepository.resetListenStats()
+            _resetState.value = ResetState.Done
+        }
+    }
+
+    // ── Réindexation bibliothèque ─────────────────────────────────────────────
+
+    sealed class ScanState {
+        object Idle    : ScanState()
+        object Running : ScanState()
+        data class Done(val inserted: Int, val skipped: Int) : ScanState()
+    }
+
+    private val _scanState = MutableStateFlow<ScanState>(ScanState.Idle)
+    val scanState: StateFlow<ScanState> = _scanState
+
+    fun scanLibrary() {
+        if (_scanState.value is ScanState.Running) return
+        viewModelScope.launch {
+            _scanState.value = ScanState.Running
+            val result = libraryScanner.scan()
+            _scanState.value = ScanState.Done(result.inserted, result.skipped)
+        }
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -51,6 +109,10 @@ fun SettingsScreen(viewModel: SettingsViewModel = hiltViewModel()) {
     val normalization  by viewModel.normalizationEnabled.collectAsState()
     val defaultShuffle by viewModel.defaultShuffle.collectAsState()
     val defaultQuality by viewModel.defaultQuality.collectAsState()
+    val keepScreenOn      by viewModel.keepScreenOn.collectAsState()
+    val coverBackground   by viewModel.coverBackground.collectAsState()
+    val scanState      by viewModel.scanState.collectAsState()
+    val resetState     by viewModel.resetState.collectAsState()
 
     val qualities = listOf("128k" to "128 kbps (économique)", "192k" to "192 kbps (équilibre)", "320k" to "320 kbps (haute qualité)")
 
@@ -86,6 +148,26 @@ fun SettingsScreen(viewModel: SettingsViewModel = hiltViewModel()) {
             }
 
             item {
+                SettingSwitch(
+                    icon    = Icons.Default.LightMode,
+                    title   = "Garder l'écran allumé",
+                    subtitle = "Empêche la mise en veille pendant la lecture",
+                    checked = keepScreenOn,
+                    onCheckedChange = viewModel::setKeepScreenOn
+                )
+            }
+
+            item {
+                SettingSwitch(
+                    icon    = Icons.Default.Palette,
+                    title   = "Fond couleur dominante",
+                    subtitle = "Teinte le lecteur avec la couleur de la couverture",
+                    checked = coverBackground,
+                    onCheckedChange = viewModel::setCoverBackground
+                )
+            }
+
+            item {
                 Text("Téléchargements",
                     modifier = Modifier.padding(16.dp, 16.dp, 16.dp, 4.dp),
                     style = MaterialTheme.typography.labelLarge,
@@ -109,6 +191,92 @@ fun SettingsScreen(viewModel: SettingsViewModel = hiltViewModel()) {
                             Text(label)
                         }
                     }
+                }
+            }
+
+            item {
+                Text("Bibliothèque",
+                    modifier = Modifier.padding(16.dp, 16.dp, 16.dp, 4.dp),
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.primary)
+            }
+
+            item {
+                val isScanning = scanState is SettingsViewModel.ScanState.Running
+                ListItem(
+                    leadingContent  = { Icon(Icons.Default.LibraryMusic, null) },
+                    headlineContent = { Text("Réindexer la bibliothèque") },
+                    supportingContent = {
+                        Text(
+                            when (val s = scanState) {
+                                is SettingsViewModel.ScanState.Idle    -> "Retrouve les musiques après une réinstallation"
+                                is SettingsViewModel.ScanState.Running -> "Scan en cours…"
+                                is SettingsViewModel.ScanState.Done    -> "${s.inserted} ajoutée(s), ${s.skipped} déjà présente(s)"
+                            },
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    },
+                    trailingContent = {
+                        if (isScanning) {
+                            CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                        } else {
+                            FilledTonalButton(onClick = viewModel::scanLibrary) {
+                                Text("Scanner")
+                            }
+                        }
+                    }
+                )
+                HorizontalDivider()
+            }
+
+            item {
+                var showResetConfirm by remember { mutableStateOf(false) }
+                val isResetting = resetState is SettingsViewModel.ResetState.Running
+
+                ListItem(
+                    leadingContent  = { Icon(Icons.Default.DeleteSweep, null) },
+                    headlineContent = { Text("Réinitialiser les statistiques") },
+                    supportingContent = {
+                        Text(
+                            when (resetState) {
+                                is SettingsViewModel.ResetState.Idle    -> "Efface uniquement les temps d'écoute"
+                                is SettingsViewModel.ResetState.Running -> "Réinitialisation…"
+                                is SettingsViewModel.ResetState.Done    -> "Statistiques réinitialisées"
+                            },
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    },
+                    trailingContent = {
+                        if (isResetting) {
+                            CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                        } else {
+                            FilledTonalButton(
+                                onClick = { showResetConfirm = true },
+                                colors  = ButtonDefaults.filledTonalButtonColors(
+                                    containerColor = MaterialTheme.colorScheme.errorContainer
+                                )
+                            ) { Text("Effacer") }
+                        }
+                    }
+                )
+                HorizontalDivider()
+
+                if (showResetConfirm) {
+                    AlertDialog(
+                        onDismissRequest = { showResetConfirm = false },
+                        icon    = { Icon(Icons.Default.Warning, null) },
+                        title   = { Text("Réinitialiser les statistiques ?") },
+                        text    = { Text("Cette action effacera uniquement les temps d'écoute enregistrés. Vos musiques et playlists ne seront pas affectées.") },
+                        confirmButton = {
+                            Button(
+                                onClick = { viewModel.resetListenStats(); showResetConfirm = false },
+                                colors  = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                            ) { Text("Effacer") }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { showResetConfirm = false }) { Text("Annuler") }
+                        }
+                    )
                 }
             }
 

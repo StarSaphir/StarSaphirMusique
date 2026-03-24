@@ -94,7 +94,8 @@ class DownloadWorker @AssistedInject constructor(
 
             Log.d(TAG, "Downloaded ${outputFile.length() / 1024}KB → ${outputFile.name}")
 
-            val durationMs = getDuration(outputFile)
+            val durationMs    = getDuration(outputFile)
+            val replayGainDb  = computeReplayGainDb(outputFile)
             trackDao.insertTrack(TrackEntity(
                 id             = trackId,
                 title          = title,
@@ -104,7 +105,8 @@ class DownloadWorker @AssistedInject constructor(
                 thumbnailPath  = if (thumbFile.exists()) thumbFile.absolutePath else null,
                 durationMs     = durationMs,
                 youtubeVideoId = videoId,
-                downloadedAt   = System.currentTimeMillis()
+                downloadedAt   = System.currentTimeMillis(),
+                replayGainDb   = replayGainDb
             ))
 
             downloadDao.updateProgress(id.toString(), DownloadStatus.DONE, 100)
@@ -172,6 +174,89 @@ class DownloadWorker @AssistedInject constructor(
             }
         }
         conn.disconnect()
+    }
+
+    /**
+     * Calcule un gain de normalisation basé sur l'amplitude RMS du fichier audio.
+     * Cible : -18 dBFS (niveau broadcast standard).
+     *
+     * Utilise MediaCodec pour décoder un échantillon ~10 s au milieu du fichier
+     * (suffisant pour estimer le niveau sans traiter tout le fichier).
+     * Retourne un delta en dB limité à [-12, +12] pour éviter la saturation.
+     * Retourne 0f en cas d'erreur (normalisation désactivée pour ce morceau).
+     */
+    private fun computeReplayGainDb(file: File): Float {
+        val TARGET_DBFS = -18f          // cible broadcast
+        val MAX_GAIN_DB =  12f
+        try {
+            val extractor = android.media.MediaExtractor()
+            extractor.setDataSource(file.absolutePath)
+            // Trouver la piste audio
+            var audioTrack = -1
+            var mime = ""
+            for (i in 0 until extractor.trackCount) {
+                val fmt = extractor.getTrackFormat(i)
+                val m = fmt.getString(android.media.MediaFormat.KEY_MIME) ?: continue
+                if (m.startsWith("audio/")) { audioTrack = i; mime = m; break }
+            }
+            if (audioTrack < 0) { extractor.release(); return 0f }
+            extractor.selectTrack(audioTrack)
+
+            // Sauter au milieu du fichier pour échantillonner ~5 s
+            val durationUs = getDuration(file) * 1000L
+            if (durationUs > 10_000_000L)
+                extractor.seekTo(durationUs / 2, android.media.MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+
+            val format = extractor.getTrackFormat(audioTrack)
+            val codec  = android.media.MediaCodec.createDecoderByType(mime)
+            codec.configure(format, null, null, 0)
+            codec.start()
+
+            var sumSq  = 0.0
+            var count  = 0L
+            val info   = android.media.MediaCodec.BufferInfo()
+            val maxUs  = extractor.sampleTime + 5_000_000L  // 5 secondes
+            var eos    = false
+
+            while (!eos && extractor.sampleTime < maxUs) {
+                // Alimenter l'entrée
+                val inIdx = codec.dequeueInputBuffer(5_000)
+                if (inIdx >= 0) {
+                    val buf = codec.getInputBuffer(inIdx)!!
+                    val n   = extractor.readSampleData(buf, 0)
+                    if (n < 0) {
+                        codec.queueInputBuffer(inIdx, 0, 0, 0,
+                            android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                        eos = true
+                    } else {
+                        codec.queueInputBuffer(inIdx, 0, n, extractor.sampleTime, 0)
+                        extractor.advance()
+                    }
+                }
+                // Lire la sortie PCM
+                val outIdx = codec.dequeueOutputBuffer(info, 5_000)
+                if (outIdx >= 0) {
+                    val buf = codec.getOutputBuffer(outIdx)!!
+                    val pcm = ShortArray(info.size / 2)
+                    buf.rewind()
+                    buf.asShortBuffer().get(pcm)
+                    for (s in pcm) sumSq += (s / 32768.0) * (s / 32768.0)
+                    count += pcm.size
+                    codec.releaseOutputBuffer(outIdx, false)
+                }
+            }
+            codec.stop(); codec.release(); extractor.release()
+            if (count == 0L) return 0f
+
+            val rms    = Math.sqrt(sumSq / count).toFloat()
+            val dbfs   = if (rms > 0) 20f * Math.log10(rms.toDouble()).toFloat() else -60f
+            val gain   = (TARGET_DBFS - dbfs).coerceIn(-MAX_GAIN_DB, MAX_GAIN_DB)
+            Log.d(TAG, "ReplayGain: rms=${"%.2f".format(rms)} dbfs=${"%.1f".format(dbfs)} gain=${"%.1f".format(gain)}dB")
+            return gain
+        } catch (e: Exception) {
+            Log.w(TAG, "computeReplayGainDb failed: ${e.message}")
+            return 0f
+        }
     }
 
     private fun getDuration(file: File): Long = try {

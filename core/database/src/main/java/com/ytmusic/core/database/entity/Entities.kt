@@ -19,7 +19,10 @@ data class TrackEntity(
     val isFavorite: Boolean = false,
     val downloadedAt: Long = System.currentTimeMillis(),
     val youtubeVideoId: String? = null,
-    val playCount: Long = 0L
+    val playCount: Long = 0L,
+    /** Gain de normalisation calculé au download (en dB, typiquement entre -10 et +10).
+     *  0.0 = pas de correction. Appliqué via LoudnessEnhancer.setTargetGain(). */
+    val replayGainDb: Float = 0f
 )
 
 // ─── Playlist ─────────────────────────────────────────────────────────────────

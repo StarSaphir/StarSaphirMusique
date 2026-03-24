@@ -51,6 +51,7 @@ dependencies {
     implementation(libs.datastore.preferences)
     implementation(libs.activity.compose)
     implementation(libs.core.ktx)
+    implementation(libs.androidx.palette.ktx)
 
     ksp(libs.hilt.compiler)
 }

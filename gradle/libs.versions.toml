@@ -15,6 +15,7 @@ coroutines = "1.8.1"
 lifecycle = "2.8.3"
 activity = "1.9.0"
 coil = "2.6.0"
+paletteKtx = "1.0.0"
 
 [libraries]
 # Compose
@@ -69,6 +70,7 @@ coil-compose = { group = "io.coil-kt", name = "coil-compose", version.ref = "coi
 
 # Core
 core-ktx = { group = "androidx.core", name = "core-ktx", version = "1.13.1" }
+androidx-palette-ktx = { group = "androidx.palette", name = "palette-ktx", version.ref = "paletteKtx" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

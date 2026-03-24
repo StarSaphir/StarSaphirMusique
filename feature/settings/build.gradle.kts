@@ -38,5 +38,8 @@ dependencies {
     implementation(libs.coil.compose)
     implementation(libs.datastore.preferences)
     implementation(libs.core.ktx)
+    implementation(project(":feature:library"))
+    implementation(project(":feature:library"))
+    implementation(project(":feature:library"))
     ksp(libs.hilt.compiler)
 }

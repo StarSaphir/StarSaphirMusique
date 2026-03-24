@@ -3,6 +3,9 @@ package com.ytmusic.core.domain.repository
 import com.ytmusic.core.domain.model.*
 import kotlinx.coroutines.flow.Flow
 
+/** Statistiques d'écoute par langue — défini dans le domaine pour rester indépendant de Room. */
+data class LanguageStat(val language: String, val totalListenedMs: Long, val sessionCount: Int)
+
 interface TrackRepository {
     fun getAllTracks(): Flow<List<Track>>
     fun searchTracks(query: String): Flow<List<Track>>
@@ -37,12 +40,15 @@ interface DownloadRepository {
 
 interface StatsRepository {
     fun getTotalListenedMs(): Flow<Long>
+    fun getTotalSessionCount(): Flow<Int>            // nouveau
     fun getTopTracks(limit: Int): Flow<List<TrackStat>>
     fun getTopArtists(limit: Int): Flow<List<ArtistStat>>
+    fun getTopLanguages(limit: Int): Flow<List<LanguageStat>>        // nouveau
     fun getRecentTracks(limit: Int): Flow<List<Track>>
     fun getRecentPlaylistIds(limit: Int): Flow<List<String>>
     fun getDailyAverageMs(): Flow<Double>
     suspend fun recordSession(trackId: String, playlistId: String?, listenedMs: Long)
+    suspend fun resetListenStats()
 }
 
 interface SettingsRepository {
@@ -52,4 +58,8 @@ interface SettingsRepository {
     suspend fun setDefaultShuffle(enabled: Boolean)
     fun getDefaultQuality(): Flow<String>
     suspend fun setDefaultQuality(quality: String)
+    fun getKeepScreenOn(): Flow<Boolean>
+    suspend fun setKeepScreenOn(enabled: Boolean)
+    fun getCoverBackground(): Flow<Boolean>          // nouveau
+    suspend fun setCoverBackground(enabled: Boolean) // nouveau
 }

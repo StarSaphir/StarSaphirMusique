@@ -15,7 +15,9 @@ data class Track(
     val isFavorite: Boolean = false,
     val downloadedAt: Long = 0L,
     val youtubeVideoId: String? = null,
-    val playCount: Long = 0L
+    val playCount: Long = 0L,
+    /** Gain de normalisation calculé au download (dB). 0f = pas de correction. */
+    val replayGainDb: Float = 0f
 ) {
     val effectiveDurationMs: Long
         get() = (trimEndMs ?: durationMs) - trimStartMs

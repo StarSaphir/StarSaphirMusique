@@ -39,10 +39,34 @@ class PlaylistViewModel @Inject constructor(
 ) : ViewModel() {
 
     val playlists: StateFlow<List<Playlist>> = playlistRepository.getAllPlaylistsWithTracks()
-        .stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     val allTracks: StateFlow<List<Track>> = trackRepository.getAllTracks()
-        .stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Super-playlists automatiques par artiste (≥2 morceaux) */
+    val autoByArtist: StateFlow<List<Playlist>> = trackRepository.getAllTracks()
+        .map { tracks ->
+            tracks.groupBy { it.artist.ifBlank { "Inconnu" } }
+                .filter { (_, v) -> v.size >= 2 }
+                .map { (artist, artistTracks) ->
+                    Playlist(id = "AUTO_ARTIST_$artist", name = artist, tracks = artistTracks)
+                }
+                .sortedBy { it.name.lowercase() }
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Super-playlists automatiques par langue */
+    val autoByLanguage: StateFlow<List<Playlist>> = trackRepository.getAllTracks()
+        .map { tracks ->
+            tracks.filter { !it.language.isNullOrBlank() }
+                .groupBy { it.language!! }
+                .map { (lang, langTracks) ->
+                    Playlist(id = "AUTO_LANG_$lang", name = lang, tracks = langTracks)
+                }
+                .sortedBy { it.name.lowercase() }
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     fun createPlaylist(name: String) = viewModelScope.launch {
         playlistRepository.createPlaylist(name)
@@ -50,10 +74,6 @@ class PlaylistViewModel @Inject constructor(
 
     fun deletePlaylist(id: String) = viewModelScope.launch {
         playlistRepository.deletePlaylist(id)
-    }
-
-    fun toggleFavorite(playlist: Playlist) = viewModelScope.launch {
-        playlistRepository.setFavorite(playlist.id, !playlist.isFavorite)
     }
 
     fun removeTrack(playlistId: String, trackId: String) = viewModelScope.launch {
@@ -69,11 +89,38 @@ class PlaylistViewModel @Inject constructor(
 
 @HiltViewModel
 class SuperPlaylistViewModel @Inject constructor(
-    private val playlistRepository: PlaylistRepository
+    private val playlistRepository: PlaylistRepository,
+    private val trackRepository:    TrackRepository
 ) : ViewModel() {
 
-    val playlists: StateFlow<List<Playlist>> = playlistRepository.getAllPlaylistsWithTracks()
-        .stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+    // Playlists manuelles
+    private val manualPlaylists: Flow<List<Playlist>> =
+        playlistRepository.getAllPlaylistsWithTracks()
+
+    // Playlists auto par artiste
+    private val artistPlaylists: Flow<List<Playlist>> = trackRepository.getAllTracks()
+        .map { tracks ->
+            tracks.groupBy { it.artist.ifBlank { "Inconnu" } }
+                .filter { (_, v) -> v.size >= 2 }
+                .map { (artist, t) -> Playlist(id = "AUTO_ARTIST_$artist", name = "🎤 $artist", tracks = t) }
+                .sortedBy { it.name.lowercase() }
+        }
+
+    // Playlists auto par langue
+    private val languagePlaylists: Flow<List<Playlist>> = trackRepository.getAllTracks()
+        .map { tracks ->
+            tracks.filter { !it.language.isNullOrBlank() }
+                .groupBy { it.language!! }
+                .map { (lang, t) -> Playlist(id = "AUTO_LANG_$lang", name = "🌐 $lang", tracks = t) }
+                .sortedBy { it.name.lowercase() }
+        }
+
+    // Toutes les playlists combinées : manuelles + artistes + langues
+    val playlists: StateFlow<List<Playlist>> = combine(
+        manualPlaylists, artistPlaylists, languagePlaylists
+    ) { manual, artists, languages ->
+        manual + artists + languages
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     private val _selectedIds = MutableStateFlow<Set<String>>(emptySet())
     val selectedIds: StateFlow<Set<String>> = _selectedIds
@@ -105,33 +152,33 @@ fun PlaylistsScreen(
     viewModel:      PlaylistViewModel = hiltViewModel(),
     onPlayPlaylist: (tracks: List<Track>, startIndex: Int) -> Unit = { _, _ -> }
 ) {
-    val playlists  by viewModel.playlists.collectAsState()
-    val allTracks  by viewModel.allTracks.collectAsState()
-    var showCreate by remember { mutableStateOf(false) }
-    // Playlist ouverte en vue détail
+    val playlists      by viewModel.playlists.collectAsState()
+    val allTracks      by viewModel.allTracks.collectAsState()
+    val autoByArtist   by viewModel.autoByArtist.collectAsState()
+    val autoByLanguage by viewModel.autoByLanguage.collectAsState()
+    var showCreate     by remember { mutableStateOf(false) }
     var openedPlaylist by remember { mutableStateOf<Playlist?>(null) }
 
-    // Vue détail → écran dédié
+    // Vue détail
     openedPlaylist?.let { pl ->
-        // Trouver la version fraîche dans playlists (mise à jour en temps réel)
-        val fresh = playlists.find { it.id == pl.id } ?: pl
-        val alreadyIn = fresh.tracks.map { it.id }.toSet()
-        val available = allTracks.filter { it.id !in alreadyIn }
-
+        val isAuto = pl.id.startsWith("AUTO_ARTIST_") || pl.id.startsWith("AUTO_LANG_")
+        val fresh  = if (isAuto) pl else (playlists.find { it.id == pl.id } ?: pl)
+        val available = if (isAuto) emptyList()
+        else allTracks.filter { it.id !in fresh.tracks.map { t -> t.id }.toSet() }
         PlaylistDetailScreen(
-            playlist       = fresh,
+            playlist        = fresh,
             availableTracks = available,
-            onBack         = { openedPlaylist = null },
-            onPlay         = { tracks, idx -> onPlayPlaylist(tracks, idx) },
-            onRemoveTrack  = { trackId -> viewModel.removeTrack(fresh.id, trackId) },
-            onAddTracks    = { ids -> ids.forEach { viewModel.addTrack(fresh.id, it) } },
-            onToggleFav    = { viewModel.toggleFavorite(fresh) },
-            onDelete       = { viewModel.deletePlaylist(fresh.id); openedPlaylist = null }
+            isAutoPlaylist  = isAuto,
+            onBack          = { openedPlaylist = null },
+            onPlay          = { tracks, idx -> onPlayPlaylist(tracks, idx) },
+            onRemoveTrack   = { trackId -> viewModel.removeTrack(fresh.id, trackId) },
+            onAddTracks     = { ids -> ids.forEach { viewModel.addTrack(fresh.id, it) } },
+            onDelete        = { viewModel.deletePlaylist(fresh.id); openedPlaylist = null }
         )
         return
     }
 
-    // ── Liste des playlists ───────────────────────────────────────────────────
+    // ── Liste ─────────────────────────────────────────────────────────────────
     Column(modifier = Modifier.fillMaxSize()) {
         TopAppBar(
             title   = { Text("Playlists") },
@@ -141,26 +188,54 @@ fun PlaylistsScreen(
                 }
             }
         )
-        if (playlists.isEmpty()) {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("Aucune playlist.\nAppuie sur + pour en créer une.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f))
+        LazyColumn {
+            // ── 1. Mes playlists manuelles ────────────────────────────────────
+            item {
+                SectionHeader(Icons.Default.QueueMusic, "Mes playlists", playlists.size)
             }
-        } else {
-            LazyColumn {
+            if (playlists.isEmpty()) {
+                item {
+                    Box(Modifier.fillMaxWidth().padding(32.dp), Alignment.Center) {
+                        Text("Aucune playlist.\nAppuie sur + pour en créer une.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f))
+                    }
+                }
+            } else {
                 items(playlists, key = { it.id }) { playlist ->
                     PlaylistRow(
                         playlist  = playlist,
                         onClick   = { openedPlaylist = playlist },
                         onPlay    = { onPlayPlaylist(playlist.tracks, 0) },
-                        onShuffle = {
-                            val shuffled = playlist.tracks.shuffled()
-                            onPlayPlaylist(shuffled, 0)
-                        }
+                        onShuffle = { onPlayPlaylist(playlist.tracks.shuffled(), 0) }
                     )
                 }
             }
+            // ── 2. Par artiste ────────────────────────────────────────────────
+            if (autoByArtist.isNotEmpty()) {
+                item { SectionHeader(Icons.Default.Person, "Par artiste", autoByArtist.size) }
+                items(autoByArtist, key = { it.id }) { playlist ->
+                    PlaylistRow(
+                        playlist  = playlist,
+                        onClick   = { openedPlaylist = playlist },
+                        onPlay    = { onPlayPlaylist(playlist.tracks, 0) },
+                        onShuffle = { onPlayPlaylist(playlist.tracks.shuffled(), 0) }
+                    )
+                }
+            }
+            // ── 3. Par langue ─────────────────────────────────────────────────
+            if (autoByLanguage.isNotEmpty()) {
+                item { SectionHeader(Icons.Default.Language, "Par langue", autoByLanguage.size) }
+                items(autoByLanguage, key = { it.id }) { playlist ->
+                    PlaylistRow(
+                        playlist  = playlist,
+                        onClick   = { openedPlaylist = playlist },
+                        onPlay    = { onPlayPlaylist(playlist.tracks, 0) },
+                        onShuffle = { onPlayPlaylist(playlist.tracks.shuffled(), 0) }
+                    )
+                }
+            }
+            item { Spacer(Modifier.height(80.dp)) }
         }
     }
 
@@ -170,6 +245,28 @@ fun PlaylistsScreen(
             onDismiss = { showCreate = false }
         )
     }
+}
+
+// ─── SectionHeader ────────────────────────────────────────────────────────────
+
+@Composable
+private fun SectionHeader(
+    icon:  androidx.compose.ui.graphics.vector.ImageVector,
+    title: String,
+    count: Int
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Icon(icon, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
+        Text(title, style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.primary, modifier = Modifier.weight(1f))
+        Text("$count", style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f))
+    }
+    HorizontalDivider()
 }
 
 // ─── PlaylistRow : ligne simple dans la liste ─────────────────────────────────
@@ -237,39 +334,28 @@ fun PlaylistRow(
 fun PlaylistDetailScreen(
     playlist:        Playlist,
     availableTracks: List<Track>,
+    isAutoPlaylist:  Boolean = false,
     onBack:          () -> Unit,
     onPlay:          (tracks: List<Track>, startIndex: Int) -> Unit,
     onRemoveTrack:   (trackId: String) -> Unit,
     onAddTracks:     (List<String>) -> Unit,
-    onToggleFav:     () -> Unit,
     onDelete:        () -> Unit
 ) {
-    var showAddDialog by remember { mutableStateOf(false) }
+    var showAddDialog    by remember { mutableStateOf(false) }
     var showConfirmDelete by remember { mutableStateOf(false) }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        // ── TopAppBar ─────────────────────────────────────────────────────────
         TopAppBar(
-            title           = { Text(playlist.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-            navigationIcon  = {
-                IconButton(onClick = onBack) {
-                    Icon(Icons.Default.ArrowBack, "Retour")
-                }
-            },
+            title          = { Text(playlist.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+            navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, "Retour") } },
             actions = {
-                IconButton(onClick = onToggleFav) {
-                    Icon(
-                        imageVector = if (playlist.isFavorite) Icons.Default.Star else Icons.Default.StarBorder,
-                        contentDescription = "Favori",
-                        tint = if (playlist.isFavorite) MaterialTheme.colorScheme.primary
-                               else MaterialTheme.colorScheme.onSurface
-                    )
-                }
-                IconButton(onClick = { showAddDialog = true }) {
-                    Icon(Icons.Default.PlaylistAdd, "Ajouter des morceaux")
-                }
-                IconButton(onClick = { showConfirmDelete = true }) {
-                    Icon(Icons.Default.Delete, "Supprimer", tint = MaterialTheme.colorScheme.error)
+                if (!isAutoPlaylist) {
+                    IconButton(onClick = { showAddDialog = true }) {
+                        Icon(Icons.Default.PlaylistAdd, "Ajouter des morceaux")
+                    }
+                    IconButton(onClick = { showConfirmDelete = true }) {
+                        Icon(Icons.Default.Delete, "Supprimer", tint = MaterialTheme.colorScheme.error)
+                    }
                 }
             }
         )
@@ -352,9 +438,11 @@ fun PlaylistDetailScreen(
                             Text(track.artist, style = MaterialTheme.typography.bodySmall)
                         },
                         trailingContent = {
-                            IconButton(onClick = { onRemoveTrack(track.id) }) {
-                                Icon(Icons.Default.Remove, "Retirer de la playlist",
-                                    tint = MaterialTheme.colorScheme.error)
+                            if (!isAutoPlaylist) {
+                                IconButton(onClick = { onRemoveTrack(track.id) }) {
+                                    Icon(Icons.Default.Remove, "Retirer de la playlist",
+                                        tint = MaterialTheme.colorScheme.error)
+                                }
                             }
                         },
                         modifier = Modifier.clickable { onPlay(playlist.tracks, idx) }
@@ -403,8 +491,8 @@ fun AddTrackToPlaylistDialog(
     val selected = remember { mutableStateListOf<String>() }
     val filtered = availableTracks.filter {
         search.isBlank() ||
-        it.title.contains(search, ignoreCase = true) ||
-        it.artist.contains(search, ignoreCase = true)
+                it.title.contains(search, ignoreCase = true) ||
+                it.artist.contains(search, ignoreCase = true)
     }
 
     AlertDialog(

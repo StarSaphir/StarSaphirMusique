@@ -17,7 +17,8 @@ fun TrackEntity.toDomain() = Track(
     isFavorite    = isFavorite,
     downloadedAt  = downloadedAt,
     youtubeVideoId = youtubeVideoId,
-    playCount     = playCount
+    playCount      = playCount,
+    replayGainDb   = replayGainDb
 )
 
 fun Track.toEntity() = TrackEntity(
@@ -33,7 +34,8 @@ fun Track.toEntity() = TrackEntity(
     isFavorite    = isFavorite,
     downloadedAt  = downloadedAt,
     youtubeVideoId = youtubeVideoId,
-    playCount     = playCount
+    playCount      = playCount,
+    replayGainDb   = replayGainDb
 )
 
 // ─── Playlist ─────────────────────────────────────────────────────────────────
